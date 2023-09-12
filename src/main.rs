@@ -12,9 +12,6 @@ use rustls::server::{ServerSessionMemoryCache, StoresServerSessions};
 use serde::Serialize;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-/// The amount of worker threads that are processing handshakes in parallel
-const SERVER_THREADS: u64 = 8;
-
 /// The amount of tickets that are generated as part of a handshake
 const TICKETS_PER_HANDSHAKE: u64 = 4; // rustls' default
 
@@ -48,6 +45,10 @@ struct Cli {
     /// The output directory for the benchmark results
     #[arg(long, default_value("bench_out"))]
     output_dir: PathBuf,
+    /// The amount of server threads that should be used (defaults to the amount of physical cores
+    /// of the machine minus one)
+    #[arg(long)]
+    server_threads: Option<usize>,
 }
 
 fn main() {
@@ -79,7 +80,12 @@ fn main() {
 
 /// Executes a single benchmark run, for a specific cache size
 fn bench_run(rt: &tokio::runtime::Runtime, cache_size: usize, cli: &Cli) -> ThroughputStats {
-    let mut server = MultiThreadedServer::start(cache_size, cli);
+    let server_threads = num_cpus::get_physical() - 1;
+    if server_threads < 2 {
+        panic!("These benchmarks only make sense on machines with at least 3 cores");
+    }
+
+    let mut server = MultiThreadedServer::start(cache_size, server_threads, cli);
     let local = tokio::task::LocalSet::new();
 
     // Hammer the server from our client!
@@ -265,7 +271,7 @@ type ServerChannelRecycler = Arc<Sender<(usize, Receiver<ServerMessage>)>>;
 
 impl ServerThreadScheduler {
     fn new(client_rx: Vec<Receiver<ServerMessage>>) -> (Self, ServerChannelRecycler) {
-        let total_servers = SERVER_THREADS as usize;
+        let total_servers = client_rx.len();
 
         let (server_done_tx, server_done_rx) =
             tokio::sync::mpsc::channel::<(usize, Receiver<ServerMessage>)>(total_servers);
@@ -324,16 +330,17 @@ struct MultiThreadedServer {
 
 impl MultiThreadedServer {
     /// Start the server
-    fn start(cache_size: usize, cli: &Cli) -> Self {
+    fn start(cache_size: usize, server_threads: usize, cli: &Cli) -> Self {
         let cache = ServerSessionMemoryCache::new(cache_size);
 
         let mut client_tx = Vec::new();
         let mut client_rx = Vec::new();
         let mut join_handles = Vec::new();
 
-        for i in 0..SERVER_THREADS {
-            let rng_seed = i * 42;
-            let (tx, rx, join_handle) = Self::start_thread(cache.clone(), rng_seed, cli);
+        for i in 0..server_threads {
+            let rng_seed = i as u64 * 42;
+            let (tx, rx, join_handle) =
+                Self::start_thread(cache.clone(), rng_seed, server_threads, cli);
             client_tx.push(tx);
             client_rx.push(rx);
             join_handles.push(join_handle);
@@ -350,6 +357,7 @@ impl MultiThreadedServer {
     fn start_thread(
         cache: Arc<ServerSessionMemoryCache>,
         rng_seed: u64,
+        server_threads: usize,
         cli: &Cli,
     ) -> (
         Sender<ClientMessage>,
@@ -360,6 +368,7 @@ impl MultiThreadedServer {
         let (client_tx, mut server_rx) = tokio::sync::mpsc::channel(1);
 
         let mut stats = ServerStats::with_enough_capacity(
+            server_threads,
             cli.full_handshakes,
             cli.resumed_handshakes_per_full_handshake,
         );
@@ -450,15 +459,16 @@ struct ServerStats {
 
 impl ServerStats {
     fn with_enough_capacity(
+        server_threads: usize,
         full_handshakes: u64,
         resumed_handshakes_per_full_handshake: u64,
     ) -> Self {
         // Requests are almost evenly distributed
         let full_handshake_durations =
-            Vec::with_capacity(full_handshakes as usize / (SERVER_THREADS as usize - 1));
+            Vec::with_capacity(full_handshakes as usize / (server_threads - 1));
         let resumed_handshake_durations = Vec::with_capacity(
             (full_handshakes * resumed_handshakes_per_full_handshake) as usize
-                / (SERVER_THREADS as usize - 1),
+                / (server_threads - 1),
         );
 
         Self {

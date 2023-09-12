@@ -372,6 +372,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fastrand",
+ "num_cpus",
  "rustls",
  "serde",
  "serde_json",
