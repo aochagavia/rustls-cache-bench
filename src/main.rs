@@ -20,16 +20,15 @@ const TICKETS_PER_HANDSHAKE: u64 = 4; // rustls' default
 enum ClientMessage {
     /// Shutdown the server thread
     Shutdown,
-    /// Run a full handshake
-    FullHandshake,
-    /// Run a resumed handshake
-    ResumedHandshake(Vec<u8>),
+    /// Run the given amount of handshakes.
+    ///
+    /// For each handshake, the server determines whether it should be full or resumed according to
+    /// `Cli::resumed_handshake_ratio`.
+    HandshakeBatch(u64),
 }
 
-/// A message from the server to the client, meaning that the handshake has completed.
-///
-/// The vector contains tickets that can be used for the resumed handshake.
-struct ServerMessage(Vec<Vec<u8>>);
+/// A message from the server to the client, meaning that the handshake batch has completed
+struct ServerMessage;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -51,15 +50,27 @@ struct Cli {
     #[arg(long)]
     server_threads: Option<usize>,
     /// Whether a noop cache should be used instead of SessionMemoryCache (useful to check the
-    /// maximum possible throughput for this setup)
+    /// maximum possible throughput for the provided batch size)
     #[arg(long)]
-    noop_cache: bool,
+    noop: bool,
+    /// The size of each handshake batch submitted by the client to the server's worker threads in a
+    /// single request (minimum value = 1)
+    #[arg(long, default_value("3"))]
+    batch_size: u64,
 }
 
 fn main() {
     let cli = Cli::parse();
     if cli.cache_sizes.is_empty() {
         println!("At least one value should be provided through --cache-sizes (run again with `--help` for details)");
+    }
+    if cli.resumed_handshake_ratio < 0.0 || cli.resumed_handshake_ratio > 1.0 {
+        println!("--resumed-handshake-ratio should be between 0 and 1 (run again with `--help` for details)");
+        return;
+    }
+    if cli.batch_size == 0 {
+        println!("--batch-size should be at least 1 (run again with `--help` for details)");
+        return;
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -79,20 +90,11 @@ fn bench_run(rt: &tokio::runtime::Runtime, cache_size: usize, cli: &Cli) {
         panic!("These benchmarks only make sense on machines with at least 3 cores");
     }
 
-    let cache: Arc<dyn StoresServerSessions> = if cli.noop_cache {
+    let cache: Arc<dyn StoresServerSessions> = if cli.noop {
         Arc::new(NoServerSessionStorage {})
     } else {
         ServerSessionMemoryCache::new(cache_size)
     };
-
-    // Generate initial tickets
-    let mut initial_tickets = Vec::with_capacity(server_threads);
-    let mut rng = Rng::new();
-    for _ in 0..server_threads {
-        let ticket = generate_ticket(&mut rng);
-        cache.put(ticket.clone(), generate_value());
-        initial_tickets.push(ticket);
-    }
 
     // Start the server
     let server = MultiThreadedServer::start(cache, server_threads, cli);
@@ -101,12 +103,7 @@ fn bench_run(rt: &tokio::runtime::Runtime, cache_size: usize, cli: &Cli) {
     let local = tokio::task::LocalSet::new();
     let client_stats = local.block_on(
         rt,
-        run_client(
-            cli.handshakes,
-            cli.resumed_handshake_ratio,
-            initial_tickets,
-            server.channels,
-        ),
+        run_client(cli.handshakes, cli.batch_size, server.channels),
     );
 
     // Shut down the server threads
@@ -142,17 +139,16 @@ fn save_handshake_stats(
         .flat_map(|s| &s.handshake_durations)
         .sum();
 
-    let total_handshakes = client_stats.handshake_durations.len();
+    let total_handshakes: u64 = server_stats.iter().map(|s| s.handled_handshakes).sum();
+    let handshake_client_total = client_stats
+        .handshake_durations
+        .iter()
+        .sum::<Duration>();
 
     let throughput_stats = ThroughputStats {
         cache_size,
-        requests_per_second: total_handshakes as f64 / client_stats.time_handshaking.as_secs_f64(),
-        client_side_seconds: client_stats
-            .handshake_durations
-            .iter()
-            .sum::<Duration>()
-            .as_secs_f64(),
-        server_side_seconds: handshake_server_total.as_secs_f64(),
+        handshakes_per_second: total_handshakes as f64 / client_stats.time_handshaking.as_secs_f64(),
+        server_saturation: handshake_server_total.as_secs_f64() / handshake_client_total.as_secs_f64(),
     };
 
     let file = File::create(base_dir.join("throughput.json")).unwrap();
@@ -162,8 +158,7 @@ fn save_handshake_stats(
 /// Hammers the server with as many requests as possible, from a single thread
 async fn run_client(
     handshakes: u64,
-    resumed_handshake_ratio: f64,
-    initial_tickets: Vec<Vec<u8>>,
+    batch_size: u64,
     server_threads: Vec<(Sender<ClientMessage>, Receiver<ServerMessage>)>,
 ) -> ClientStats {
     let handshake_durations = Rc::new(RefCell::new(Vec::with_capacity(handshakes as usize)));
@@ -173,18 +168,11 @@ async fn run_client(
 
     // Spawn a recurring handshaking task against each server thread
     let mut handles = Vec::new();
-    for (i, ((tx, mut rx), initial_ticket)) in server_threads
-        .into_iter()
-        .zip(initial_tickets)
-        .enumerate()
-    {
+    for (tx, mut rx) in server_threads {
         let handshake_durations = handshake_durations.clone();
         let handshakes_left = handshakes_left.clone();
 
         let handle = tokio::task::spawn_local(async move {
-            let mut rng = Rng::with_seed(i as u64 * 999);
-            let mut prev_ticket = initial_ticket;
-
             loop {
                 let left = handshakes_left.get();
                 if left == 0 {
@@ -192,18 +180,18 @@ async fn run_client(
                     tx.send(ClientMessage::Shutdown).await.unwrap();
                     break;
                 } else {
-                    handshakes_left.set(left - 1);
-                }
+                    let batch_size = left.min(batch_size);
+                    handshakes_left.set(left - batch_size);
 
-                prev_ticket = run_handshake(
-                    &tx,
-                    &mut rx,
-                    &mut rng,
-                    prev_ticket,
-                    handshake_durations.clone(),
-                    resumed_handshake_ratio,
-                )
-                .await;
+                    let start_handshake = Instant::now();
+                    tx.send(ClientMessage::HandshakeBatch(batch_size))
+                        .await
+                        .unwrap();
+                    rx.recv().await.unwrap();
+                    let handshake_duration = Instant::now() - start_handshake;
+
+                    handshake_durations.borrow_mut().push(handshake_duration);
+                }
             }
         });
 
@@ -230,37 +218,6 @@ async fn run_client(
     }
 }
 
-/// Runs a handshake against one of the server threads, communicating through the provided channel.
-///
-/// Returns a ticket that can be used in a future handshake.
-async fn run_handshake(
-    tx: &Sender<ClientMessage>,
-    rx: &mut Receiver<ServerMessage>,
-    rng: &mut Rng,
-    prev_ticket: Vec<u8>,
-    handshake_durations: Rc<RefCell<Vec<Duration>>>,
-    resumed_handshake_ratio: f64,
-) -> Vec<u8> {
-    // Decide between full and resumed handshake
-    let message = if rng.f64() < resumed_handshake_ratio {
-        // Because the ticket pool is initialized with as many tickets as server threads, and
-        // every handshake makes sure to add at least one token, it is guaranteed the pool will
-        // never be empty
-        ClientMessage::ResumedHandshake(prev_ticket)
-    } else {
-        ClientMessage::FullHandshake
-    };
-
-    // Actually do the handshake
-    let start_handshake = Instant::now();
-    tx.send(message).await.unwrap();
-    let tickets = rx.recv().await.unwrap().0;
-    let handshake_duration = Instant::now() - start_handshake;
-
-    handshake_durations.borrow_mut().push(handshake_duration);
-    tickets.into_iter().next().unwrap()
-}
-
 /// A handshake server backed by multiple worker threads
 struct MultiThreadedServer {
     /// The channels that a client can use to communicate with each thread
@@ -277,8 +234,7 @@ impl MultiThreadedServer {
 
         for i in 0..server_threads {
             let rng = Rng::with_seed(i as u64 * 42);
-            let (tx, rx, join_handle) =
-                Self::start_thread(cache.clone(), rng, server_threads, cli);
+            let (tx, rx, join_handle) = Self::start_thread(cache.clone(), rng, server_threads, cli);
             channels.push((tx, rx));
             join_handles.push(join_handle);
         }
@@ -303,33 +259,45 @@ impl MultiThreadedServer {
         let (server_tx, client_rx) = tokio::sync::mpsc::channel(1);
         let (client_tx, mut server_rx) = tokio::sync::mpsc::channel(1);
 
+        // Keep a ticket around for resumed handshakes
+        let mut ticket = generate_ticket(&mut rng);
+        cache.put(ticket.clone(), generate_value());
+
+        let resumed_handshake_ratio = cli.resumed_handshake_ratio;
         let mut stats = ServerStats::with_enough_capacity(server_threads, cli.handshakes);
         let handle = std::thread::spawn(move || {
             loop {
                 let request = server_rx.blocking_recv().unwrap();
-                if let ClientMessage::Shutdown = request {
-                    break;
-                }
+                let batch_size = match request {
+                    ClientMessage::Shutdown => break,
+                    ClientMessage::HandshakeBatch(batch_size) => batch_size,
+                };
 
                 let start = Instant::now();
-                if let ClientMessage::ResumedHandshake(key) = &request {
-                    // Resumed handshakes call `ServerSessionMemoryCache::take` (in TLS 1.3)
-                    cache.take(key.as_slice());
+
+                for _ in 0..batch_size {
+                    let should_resume = rng.f64() < resumed_handshake_ratio;
+                    if should_resume {
+                        // Resumed handshakes call `ServerSessionMemoryCache::take` (in TLS 1.3)
+                        cache.take(&ticket);
+                    }
+
+                    // Generate the same amount of new tickets as rustls (though without a
+                    // cryptographically secure generator)
+                    let mut tickets = Vec::with_capacity(TICKETS_PER_HANDSHAKE as usize);
+                    for _ in 0..TICKETS_PER_HANDSHAKE {
+                        let key = generate_ticket(&mut rng);
+                        tickets.push(key.clone());
+                        cache.put(key, generate_value());
+                    }
+
+                    ticket = tickets.into_iter().next().unwrap();
                 }
 
-                // All handshakes generate new tickets
-                let mut tickets = Vec::with_capacity(TICKETS_PER_HANDSHAKE as usize);
-                for _ in 0..TICKETS_PER_HANDSHAKE {
-                    let key = generate_ticket(&mut rng);
-                    tickets.push(key.clone());
-                    cache.put(key, generate_value());
-                }
                 let done = Instant::now();
-
-                server_tx.blocking_send(ServerMessage(tickets)).unwrap();
-
-                stats.handled_handshakes += 1;
+                stats.handled_handshakes += batch_size;
                 stats.handshake_durations.push(done - start);
+                server_tx.blocking_send(ServerMessage).unwrap();
             }
 
             stats
@@ -354,9 +322,8 @@ fn generate_value() -> Vec<u8> {
 #[derive(Serialize)]
 struct ThroughputStats {
     cache_size: usize,
-    requests_per_second: f64,
-    client_side_seconds: f64,
-    server_side_seconds: f64,
+    handshakes_per_second: f64,
+    server_saturation: f64,
 }
 
 struct ClientStats {
