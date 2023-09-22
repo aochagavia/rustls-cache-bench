@@ -3,11 +3,16 @@ name = "rustls-cache-bench"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+panic = "abort"
+
 [dependencies]
 clap = { version = "4.4.2", features = ["derive"] }
+crossbeam = { version = "0.8.2", features = ["crossbeam-channel"] }
 fastrand = "2.0.0"
+mio = { version = "0.8.8", features = ["os-poll", "os-ext"] }
 num_cpus = "1.16.0"
 rustls = { git = "https://github.com/rustls/rustls.git" }
 serde = { version = "1.0.188", features = ["derive"] }
 serde_json = "1.0.106"
-tokio = { version = "1.32.0", features = ["full"] }
+timerfd = "1.5.0"
